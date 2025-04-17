@@ -20,7 +20,50 @@ A fixed point type would encode and keep track of the precision through arithmet
 ## Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-TODO
+The `amaranth.lib.fixed` module provides _fixed point types_, which are used for representing fractional values efficiently in hardware.
+
+### Introduction
+
+Fixed point shapes are defined by their underlying storage and number of fractional bits. The following declares an unsigned fixed point signal with 16 bits of underlying storage, split into 9 integer and 7 fractional bits:
+
+```python
+x = Signal(fixed.Shape(unsigned(16), f_bits=7))
+```
+
+Although one can create fixed point shapes by instantiating `fixed.Shape` directly, it is common in the DSP world to use _Q notation_ to represent such types. The `amaranth.lib.fixed` module provides `fixed.UQ` and `fixed.SQ` aliases for this purpose:
+
+```python
+>>> Signal(fixed.UQ(i_bits=9, f_bits=7))
+fixed.Shape(unsigned(16), f_bits=7)
+>>> Signal(fixed.SQ(i_bits=2, f_bits=6))
+fixed.Shape(signed(8), f_bits=6)
+```
+
+Using `fixed.Shape` to represent fractional values allows the number of fractional bits (and required shift) to be tracked through arithmetic operations:
+
+```python
+>>> a = Signal(fixed.UQ(9, 7))
+>>> a
+fixed.Shape(unsigned(16), f_bits=7)
+>>> a * a
+fixed.Shape(unsigned(32), f_bits=14)
+```
+
+### Examples
+
+class Boxcar(wiring.Component):
+
+    i: In(fixed.SQ(0, 16))
+    o: Out(fixed.SQ(0, 16))
+
+    def elaborate():
+        m = Module()
+        SQ16 = fixed.SQ(1, 15)
+        alpha = 0.9
+        beta = fixed.Const(0.9, shape=SQ16)
+        b = fixed.Const(0.1, shape=SQ16)
+        m.d.sync += o.eq(o*a + i*b)
+        return m
 
 ## Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
