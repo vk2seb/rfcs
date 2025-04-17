@@ -24,46 +24,121 @@ The `amaranth.lib.fixed` module provides _fixed point types_, which are used for
 
 ### Introduction
 
-Fixed point shapes are defined by their underlying storage and number of fractional bits. The following declares an unsigned fixed point signal with 16 bits of underlying storage, split into 9 integer and 7 fractional bits:
+Fixed point shapes are defined by their underlying storage and number of fractional bits. For example, consider an unsigned fixed point signal with 16 bits of underlying storage, split into 9 integer and 7 fractional bits:
+
+TODO NICE IMAGE
+
+This type could be represented as follows:
 
 ```python
 x = Signal(fixed.Shape(unsigned(16), f_bits=7))
 ```
 
-Although one can create fixed point shapes by instantiating `fixed.Shape` directly, it is common in the DSP world to use _Q notation_ to represent such types. The `amaranth.lib.fixed` module provides `fixed.UQ` and `fixed.SQ` aliases for this purpose:
+Although one can create fixed point shapes by instantiating `fixed.Shape` directly, it is common in the DSP world to use _Q notation_ to represent such types. In Q notation, types are instead defined by a number of integer and fractional bits, with the underlying storage calculated from these. The `amaranth.lib.fixed` module provides `fixed.UQ` and `fixed.SQ` aliases for this purpose:
 
 ```python
->>> Signal(fixed.UQ(i_bits=9, f_bits=7))
+>>> fixed.UQ(9, 7)
 fixed.Shape(unsigned(16), f_bits=7)
->>> Signal(fixed.SQ(i_bits=2, f_bits=6))
+>>> fixed.SQ(2, 6)
 fixed.Shape(signed(8), f_bits=6)
 ```
 
-Using `fixed.Shape` to represent fractional values allows the number of fractional bits (and required shift) to be tracked through arithmetic operations:
+_Note: `amaranth.lib.fixed` includes the sign bit in the number of integer bits passed to `fixed.SQ`. Some forms of Q notation exclude the sign bit from the number of integer bits - be careful if translating existing algorithms!_
+
+Using `fixed.Shape` to represent fractional values allows the number of fractional bits (and associated shift) to be tracked through arithmetic operations:
 
 ```python
 >>> a = Signal(fixed.UQ(9, 7))
+>>> b = Signal(fixed.UQ(9, 7))
 >>> a
 fixed.Shape(unsigned(16), f_bits=7)
->>> a * a
+>>> a + b
+fixed.Shape(unsigned(16), f_bits=7)
+>>> a * b
 fixed.Shape(unsigned(32), f_bits=14)
 ```
 
+Here we show addition and multiplication, however `fixed.Value` defines most operators between fixed point types that one would expect. This includes comparisons, shifts, truncation and so on. We will cover this in more detail in the next sections.
+
 ### Examples
 
-class Boxcar(wiring.Component):
+Consider the implementation of a simple [Low-pass filter](https://en.wikipedia.org/wiki/Low-pass_filter), where we wish to compute the difference equation `y = y[n-1] * beta + x * (1 - beta)` using fixed point representation:
 
-    i: In(fixed.SQ(0, 16))
-    o: Out(fixed.SQ(0, 16))
+```python
+class OnePole(wiring.Component):
+
+    def __init__(self, beta=0.9, sq=fixed.SQ(1, 15)):
+        self.beta = beta
+        self.sq = sq
+        super().__init__({
+            "x": In(sq),
+            "y": Out(sq),
+        })
 
     def elaborate():
         m = Module()
-        SQ16 = fixed.SQ(1, 15)
-        alpha = 0.9
-        beta = fixed.Const(0.9, shape=SQ16)
-        b = fixed.Const(0.1, shape=SQ16)
-        m.d.sync += o.eq(o*a + i*b)
+        a = fixed.Const(self.beta, shape=self.sq)
+        b = fixed.Const(1-self.beta, shape=self.sq)
+        m.d.sync += self.y.eq(self.y*a + self.x*b)
         return m
+```
+
+Notice `fixed.Const` being used to construct fixed point constants from `float`, and the implicit truncation by `.eq()` that occurs after the types were widened by a multiplication.
+
+#### Representable constants
+
+In the above example, our `fixed.SQ` has only 1 integer bit (a single sign bit), which makes the order of operations especially important. If we had instead tried to perform our calculation as follows:
+
+```python
+o = fixed.Const(1, shape=self.sq)
+b = fixed.Const(self.beta, shape=self.sq)
+m.d.sync += self.y.eq(self.y*b + self.x*(o-b))
+```
+
+Amaranth would emit a diagnostic message on the first line because `1` is not representable as a `fixed.SQ(1, 15)`, as we can quickly verify:
+
+```python
+>>> fixed.SQ(1, 15).min().as_float()
+-1.0
+>>> fixed.SQ(1, 15).max().as_float()
+0.999
+>>> fixed.Const(1, shape=fixed.SQ(1, 15))
+ERROR
+```
+
+#### Overflow and saturation
+
+In the previous example, the intermediate statement `self.y*a + self.x*b` has shape `fixed.Shape(signed(32), f_bits=30)`. This means we are losing some information when performing `.eq()` as it truncates to `fixed.SQ(1, 15)`. Despite this loss of precision, as long as `abs(x) < 1`, our choice of difference equation above ensured this should not overflow.
+
+If we instead consider the following:
+
+```python
+class SimpleSquare(wiring.Component):
+
+    def __init__(self, sq=fixed.SQ(8, 8)):
+        self.sq = sq
+        super().__init__({
+            "x": In(sq),
+            "y": Out(sq),
+        })
+
+    def elaborate():
+        m = Module()
+        m.d.sync += self.y.eq(self.x * self.x)
+        return m
+```
+
+If we were to take `x = 64.25`, our intermediate result `4128.0625` _would not_ fit in `i_bits=8`, meaning the value would overflow when truncated with `.eq()`. This may or may not be desirable - one has a few options:
+
+    1. Tolerate the truncation. This requires the least hardware resources and is desired when implementing a function that is known to only emit outputs with known bounds within the destination type (as `OnePole` does above).
+    2. Use a larger output type (in this case `fixed.SQ(16, 16)`), so that no truncation needs to be performed.
+    3. Use saturating arithmentic. Clamp the (larger) intermediate value to the `.min()` and `.max()` of the smaller type, before converting it to that type. Information is still lost, but overflow is not possible.
+
+In `amaranth.lib.fixed`, saturation is exposed as `.saturate(shape)`. Applied to the above example:
+
+```python
+m.d.sync += self.y.eq((self.x * self.x).saturate(self.sq))
+```
 
 ## Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -102,9 +177,10 @@ The following operations are defined on it:
   - If `value` is a `Value`, it'll be assigned directly to the underlying `Value`.
   - If `value` is an `int` or `float`, it'll be cast to a `fixed.Const` first.
   - If `value` is a `fixed.Value`, the precision will be extended or truncated as required.
-- `.reshape(f_bits)`: Return a new `fixed.Value` with `f_bits` fractional bits, truncating or extending precision as required.
-- `.reshape(shape)`: Return a new `fixed.Value` with shape `shape`, truncating or extending precision as required.
-  - For example, `value1.reshape(SQ(4, 4))` * value2
+- `.trunc(f_bits)`: Return a new `fixed.Value` with `f_bits` fractional bits, truncating precision as required. Increasing `f_bits` with `.trunc()` raises an exception.
+- `.reshape(shape)`: Return a new `fixed.Value`of shape `shape`, truncating or extending precision as required.
+- `.clamp(lo, hi)`: Clamp a `fixed.Value` between `lo` and `hi`. This is implemented as a multiplexer, with `lo` and `hi` inclusive.
+- `.saturate(shape)`: This is an alias for `value.clamp(shape.min(), shape.max()).reshape(shape)`, useful for reducing the width of types where saturation is desired rather than overflow.
 - `.__add__(other)`, `.__radd__(other)`, `.__sub__(other)`, `.__rsub__(other)`, `.__mul__(other)`, `.__rmul__(other)`: Binary arithmetic operators.
   - If `other` is a `Value`, it'll be cast to a `fixed.Value` first.
   - If `other` is an `int`, it'll be cast to a `fixed.Const` first.
@@ -130,7 +206,7 @@ The following additional operations are defined on it:
   - If `value` is a `float` and `shape` is not specified, the smallest shape that gives a perfect representation will be selected.
     If `shape` is specified, `value` will be truncated to the closest representable value first.
   - If `shape` is specified and `value` is too large to be represented by that shape, an exception is thrown.
-    - The exception invites the user to try `clamp=True` to squash this exception, instead clamping the constant to the maximum / minimum value representable by the provided `shape`.
+    - The exception invites the user to try `clamp=True` to squash this exception, instead clamping the constant to the maximum / minimum value representable by the provided `shape` (Motivation: imagine initializing a LUT of `fixed.Const` from `math.sin`, where the destination type has only a sign bit)
 - `.as_integer_ratio()`: Return the value represented as an integer ratio `tuple`.
 - `.as_float()`: Return the value represented as a `float`.
 - Operators are extended to return a `fixed.Const` if all operands are constant.
